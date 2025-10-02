@@ -1,0 +1,246 @@
+---
+title: "SalinasCode"
+author: "YeiBurgos"
+date: "2025-10-02"
+output: html_document
+---
+
+
+# =========================================================
+# Set working directory
+# =========================================================
+```{r}
+setwd("~/CTFSalinas")
+
+# =========================================================
+# Install & load required packages
+# =========================================================
+if (!requireNamespace("BiocManager", quietly = TRUE)) install.packages("BiocManager")
+
+packages <- c("phyloseq", "ggplot2", "dplyr", "tidyr", "tibble", 
+              "vegan", "ComplexHeatmap", "DESeq2", "rstatix", "microbiome")
+
+for (pkg in packages) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    if (pkg %in% c("phyloseq", "DESeq2", "microbiome")) BiocManager::install(pkg)
+    else install.packages(pkg)
+  }
+  library(pkg, character.only = TRUE)
+}
+```
+
+# =========================================================
+# Load Mothur files
+# =========================================================
+```{r}
+otu_file <- "final.opti_mcc.0.03.subsample.shared"
+tax_file <- "final.opti_mcc.0.03.cons.taxonomy"
+metadata_file <- "Salinasfrog.design.csv"
+```
+
+# -------------------------
+# Read OTU table
+# -------------------------
+```{r}
+otu_df <- read.table(otu_file, header = TRUE, sep = "\t")
+rownames(otu_df) <- otu_df$Group
+otu_numeric_df <- otu_df[, -(1:3)]
+otu_matrix <- t(otu_numeric_df)  # OTUs as rows
+
+# Clean OTU column names
+colnames(otu_matrix) <- trimws(colnames(otu_matrix))
+colnames(otu_matrix) <- toupper(colnames(otu_matrix))
+```
+
+# -------------------------
+# Read taxonomy table
+# -------------------------
+```{r}
+tax_df_raw <- read.table(tax_file, header = TRUE, sep = "\t")
+tax_df_separated <- tax_df_raw %>%
+  separate(col = Taxonomy, 
+           into = c("Kingdom", "Phylum", "Class", "Order", "Family", "Genus"), 
+           sep = ";", fill = "right", extra = "warn")
+
+tax_df_clean <- tax_df_separated %>%
+  select(any_of(c("OTU","Kingdom","Phylum","Class","Order","Family","Genus"))) %>%
+  mutate(across(where(is.character), ~gsub("\\(\\d+\\)|k__|p__|c__|o__|f__|g__", "", .)))
+
+rownames(tax_df_clean) <- tax_df_clean$OTU
+tax_matrix <- as.matrix(tax_df_clean[, -1])
+```
+
+# -------------------------
+# Read metadata
+# -------------------------
+```{r}
+metadata_df <- read.csv(metadata_file, header = TRUE, stringsAsFactors = FALSE)
+rownames(metadata_df) <- trimws(metadata_df$Group)
+colnames(metadata_df)[colnames(metadata_df) == "Sample"] <- "SampleType"
+rownames(metadata_df) <- toupper(rownames(metadata_df))
+metadata_df$SampleType <- as.factor(metadata_df$SampleType)
+```
+
+# -------------------------
+# Filter to shared samples
+# -------------------------
+```{r}
+shared_samples <- intersect(colnames(otu_matrix), rownames(metadata_df))
+if(length(shared_samples) == 0) stop("No shared samples between OTU table and metadata!")
+
+otu_matrix_filtered <- otu_matrix[, shared_samples, drop = FALSE]
+metadata_df_filtered <- metadata_df[shared_samples, , drop = FALSE]
+```
+
+# =========================================================
+# Create phyloseq object
+# =========================================================
+```{r}
+OTU <- otu_table(otu_matrix_filtered, taxa_are_rows = TRUE)
+TAX <- tax_table(tax_matrix)
+META <- sample_data(metadata_df_filtered)
+
+physeq <- phyloseq(OTU, TAX, META)
+print(physeq)
+```
+
+# =========================================================
+# Force "10S Body" and "10S Gland" to be last everywhere
+# =========================================================
+```{r}
+sample_ids <- sample_names(physeq)
+frog_id <- gsub("b$", "", sample_ids, ignore.case = TRUE)
+sample_type <- ifelse(grepl("b$", sample_ids, ignore.case = TRUE), "Gland", "Body")
+new_labels <- paste(frog_id, sample_type)
+
+# Desired order: all others first, then 10S Body and 10S Gland at the end
+ordered_labels <- c(
+  setdiff(unique(new_labels), c("10S Body", "10S Gland")),
+  "10S Body", "10S Gland"
+)
+
+# Attach to sample_data
+sample_data(physeq)$FrogID <- frog_id
+sample_data(physeq)$SampleType <- factor(sample_type, levels = c("Body", "Gland"))
+sample_data(physeq)$Label <- factor(new_labels, levels = ordered_labels)
+```
+
+# =========================================================
+# Alpha Diversity
+# =========================================================
+```{r}
+sample_type_cols <- c("Body"="#1f78b4", "Gland"="#33a02c")
+sample_type_shapes <- c("Body"=16, "Gland"=17)
+
+alpha_data <- estimate_richness(physeq, measures = "Shannon")
+alpha_data$SampleType <- sample_data(physeq)$SampleType
+
+alpha_plot <- plot_richness(physeq, x = "SampleType", measures = c("Shannon")) +
+  geom_boxplot(aes(fill = SampleType), alpha = 0.7) +
+  scale_fill_manual(values = sample_type_cols, name = "Sample Type") +
+  labs(title = "Alpha Diversity (Shannon Index)", x = "Sample Type", y = "Shannon Diversity") +
+  theme(legend.position = "none")
+print(alpha_plot)
+
+kruskal_test_result <- rstatix::kruskal_test(data = alpha_data, Shannon ~ SampleType)
+print(kruskal_test_result)
+```
+
+# =========================================================
+# Beta Diversity (PCoA)
+# =========================================================
+```{r}
+bray_dist <- phyloseq::distance(physeq, method = "bray")
+pcoa_ord <- ordinate(physeq, method = "PCoA", distance = bray_dist)
+
+pcoa_plot <- plot_ordination(physeq, pcoa_ord, type = "samples", color = "SampleType", shape = "SampleType") +
+  geom_point(size = 4) +
+  stat_ellipse(type = "t", level = 0.95) +
+  scale_color_manual(name = "Sample Type", values = sample_type_cols) +
+  scale_shape_manual(name = "Sample Type", values = sample_type_shapes) +
+  labs(title = "PCoA of Microbial Communities", subtitle = "Bray-Curtis Dissimilarity")
+print(pcoa_plot)
+
+sample_df <- data.frame(sample_data(physeq))
+permanova_result <- vegan::adonis2(bray_dist ~ SampleType, data = sample_df, permutations = 999)
+print(permanova_result)
+```
+
+# =========================================================
+# AMOVA (Analysis of Molecular Variance)
+# =========================================================
+```{r}
+if (!requireNamespace("pegas", quietly = TRUE)) {
+  install.packages("pegas")
+}
+library(pegas)
+
+# Convert Bray-Curtis distance object into a matrix
+dist_mat <- as.matrix(bray_dist)
+
+# Prepare grouping factor (here: SampleType from metadata)
+groups <- sample_df$SampleType
+
+# Run AMOVA (pegas requires a formula interface with dist object)
+amova_result <- pegas::amova(bray_dist ~ groups, nperm = 999)
+print(amova_result)
+```
+
+
+# =========================================================
+# Taxonomic Composition
+# =========================================================
+```{r}
+physeq_phylum <- tax_glom(physeq, taxrank = "Phylum")
+tax_table(physeq_phylum)[, "Phylum"][is.na(tax_table(physeq_phylum)[, "Phylum"])] <- "Unclassified"
+physeq_phylum_rel <- transform_sample_counts(physeq_phylum, function(x) x / sum(x))
+
+cols <- c("Body"="#1f78b4", "Gland"="#33a02c")
+
+bar_plot <- plot_bar(physeq_phylum_rel, x = "Label", fill = "Phylum") +
+  geom_bar(aes(color = SampleType), stat = "identity", position = "stack", size = 0.3) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(values = rainbow(length(unique(tax_table(physeq_phylum_rel)[,"Phylum"])))) +
+  scale_color_manual(values = cols, guide = "none") +
+  labs(title = "Relative Abundance by Phylum per Frog Sample", 
+       x = "Sample (Frog + Type)", y = "Relative Abundance (%)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(bar_plot)
+```
+
+```{r}
+# =========================================================
+# Taxonomic Composition at Genus level (Top 100 + Other)
+# =========================================================
+physeq_genus <- tax_glom(physeq, taxrank = "Genus")
+
+# Replace missing Genus with "Unclassified"
+tax_table(physeq_genus)[, "Genus"][is.na(tax_table(physeq_genus)[, "Genus"])] <- "Unclassified"
+
+# Transform to relative abundance
+physeq_genus_rel <- transform_sample_counts(physeq_genus, function(x) x / sum(x))
+
+# Identify top 20 genera by overall abundance
+genus_sums <- taxa_sums(physeq_genus_rel)
+top100_genera <- names(sort(genus_sums, decreasing = TRUE))[1:20]
+
+# Merge non-top genera into "Other"
+physeq_genus_top100 <- merge_taxa(physeq_genus_rel, taxa_names(physeq_genus_rel)[!taxa_names(physeq_genus_rel) %in% top100_genera])
+tax_table(physeq_genus_top100)[which(taxa_names(physeq_genus_top100) == "OTUmerged"), "Genus"] <- "Other"
+
+# Colors for Body vs Gland
+cols <- c("Body"="#1f78b4", "Gland"="#33a02c")
+
+# Barplot at Genus level (Top 100 + Other)
+bar_plot_genus <- plot_bar(physeq_genus_top100, x = "Label", fill = "Genus") +
+  geom_bar(aes(color = SampleType), stat = "identity", position = "stack", size = 0.3) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_fill_manual(values = rainbow(length(unique(tax_table(physeq_genus_top100)[,"Genus"])))) +
+  scale_color_manual(values = cols, guide = "none") +
+  labs(title = "Relative Abundance (Top 20 Genera + Other)", 
+       x = "Sample (Frog + Type)", y = "Relative Abundance (%)") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(bar_plot_genus)
+```
